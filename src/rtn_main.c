@@ -1,33 +1,18 @@
-#define _GNU_SOURCE
-#include <errno.h>
-#include <getopt.h>
-#include <pthread.h>
-#include <sched.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+////////////////////////////////////////////////////////////////////////////////
+// # RT Network Application
+// 
+// ## Todos
 
-#include <sys/mman.h>
+////////////////////////////////////////////////////////////////////////////////
+// # Includes
+#include "rtn_base.h"
+#include "rtn_socket.h"
 
-#include <arpa/inet.h>
+// # C Files
+#include "rtn_socket.c"
 
-#include <netinet/in.h>
-#include <netinet/ip.h>
-
-#include <net/if.h>
-
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/resource.h>
-
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-
-#define NSER_PER_SEC 1000000000
-
+////////////////////////////////////////////////////////////////////////////////
+// # Application
 enum {
     ROLE_TALKER   = 0,
     ROLE_LISTENER = 1,
@@ -94,30 +79,7 @@ struct payload {
     uint8_t    type;
 };
 
-static inline int64_t
-get_realtime_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return ts.tv_sec * NSER_PER_SEC + ts.tv_nsec;
-}
-
-static inline int64_t
-normalize_time(int64_t time) {
-    return time / NSER_PER_SEC * NSER_PER_SEC;
-}
-
-void 
-set_policy(int policy, int priority) {
-    struct sched_param param;
-    memset(&param, 0, sizeof(param));
-    param.sched_priority = priority;
-    if (sched_setscheduler(0, policy, &param) == -1) {
-        perror("sched_setscheduler");
-        exit(1);
-    }
-}
-
-////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 // Globals
 
 #define MAX_NUM_PACKETS 10000000
@@ -140,40 +102,15 @@ options_t options = {
     .verbose        = false,
 };
 
-static int
-init_socket(int port, const char *ifname) {
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd == -1) {
-        perror("socket");
-        exit(1);
-    }
-
-    struct sockaddr_in addr;
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        perror("bind");
-        exit(1);
-    }
-
-    // bind to device
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
-    if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)) == -1) {
-        perror("setsockopt");
-        exit(1);
-    }
-
-    return sockfd;
-}
 
 static void
 do_talker(options_t *options) 
 {
-    int sockfd = init_socket(options->port, options->interface);
+    rt_socket *sock = rt_socket_new(options->interface, options->port, RT_SOCKET_TYPE_UDP, true);
+    if (sock == NULL) {
+        fprintf(stderr, "Failed to create socket\n");
+        exit(1);
+    }
 
     char packet[128];
 
@@ -186,7 +123,6 @@ do_talker(options_t *options)
     struct iovec iov;
     iov.iov_base = packet;
     iov.iov_len  = sizeof(packet);
-    // iov.iov_len  = options->packet_size;
 
     struct msghdr msg;
     memset(&msg, 0, sizeof(msg));
@@ -198,13 +134,13 @@ do_talker(options_t *options)
     payload_t *payload = (payload_t *)packet;
     payload->type = PAYLOAD_TYPE_DATA;
 
-    int64_t start_time  = get_realtime_ns();
-    int64_t wakeup_time = normalize_time(start_time + 2 * NSER_PER_SEC);
+    int64_t start_time  = os_time_get_rt_ns();
+    int64_t wakeup_time = os_time_normalize_ts(start_time + 2 * NSER_PER_SEC);
 
     fprintf(stderr, "Start time:  %ld\n", start_time);
     fprintf(stderr, "Wakeup time: %ld\n", wakeup_time);
 
-    // // send 1 message using sendmsg and then sleep using clock_nanosleep to wait for next cycle
+    // send 1 message using sendmsg and then sleep using clock_nanosleep to wait for next cycle
     int ret;
     struct timespec sleep_ts;
     bool stop = false;
@@ -225,19 +161,22 @@ do_talker(options_t *options)
             stop = true;
         }
 
-        int64_t now         = get_realtime_ns();
+        int64_t now         = os_time_get_rt_ns();
         payload->timestamp  = now;
         payload->seqno     += 1;
 
         // printf("Sending packet %ld at %ld\n", payload->seqno, now);
-        ret = sendmsg(sockfd, &msg, 0);
+        ret = rt_socket_send_message(sock, &msg, 0);
         if (ret == -1) {
             perror("sendmsg");
             exit(1);
         }
+
+        // try to read from error queue
+        rt_socket_errqueue_tx(sock);
     }
 
-    close(sockfd);
+    rt_socket_destroy(sock);
 }
 
 static void
@@ -246,7 +185,11 @@ do_listener(options_t *options)
     uint64_t *latencies  = malloc(MAX_NUM_PACKETS * sizeof(uint64_t));
     size_t num_latencies = 0;
 
-    int sockfd = init_socket(options->port, options->interface);
+    rt_socket *sock = rt_socket_new(options->interface, options->port, RT_SOCKET_TYPE_UDP, true);
+    if (sock == NULL) {
+        fprintf(stderr, "Failed to create socket\n");
+        exit(1);
+    }
 
     char *packet = malloc(options->packet_size);
     if (packet == NULL) {
@@ -272,7 +215,7 @@ do_listener(options_t *options)
     int ret;
     int stop = 0;
     while (!stop) {
-        ret = recvmsg(sockfd, &msg, 0);
+        ret = rt_socket_receive_message(sock, &msg, 0);
         if (ret == -1) {
             perror("recvmsg");
             exit(1);
@@ -283,7 +226,7 @@ do_listener(options_t *options)
             stop = 1;
         }
 
-        int64_t now = get_realtime_ns();
+        int64_t now = os_time_get_rt_ns();
         uint64_t latency = now - payload->timestamp;
         latencies[num_latencies++] = latency;
     }
@@ -319,14 +262,17 @@ do_listener(options_t *options)
     }
 
     fprintf(stderr, "Done\n");
-
-    close(sockfd);
+    rt_socket_destroy(sock);
 }
 
 static void
 do_pong(options_t *opts) 
 {
-    int sockfd = init_socket(opts->port, opts->interface);
+    rt_socket *sock = rt_socket_new(opts->interface, opts->port, RT_SOCKET_TYPE_UDP, true);
+    if (sock == NULL) {
+        fprintf(stderr, "Failed to create socket\n");
+        exit(1);
+    }
 
     char *packet = malloc(opts->packet_size);
     if (packet == NULL) {
@@ -355,13 +301,13 @@ do_pong(options_t *opts)
     int ret;
     int stop = 0;
     while (!stop) {
-        ret = recvmsg(sockfd, &msg, 0);
+        ret = rt_socket_receive_message(sock, &msg, 0);
         if (ret == -1) {
             perror("recvmsg");
             exit(1);
         }
 
-        int64_t now        = get_realtime_ns();
+        int64_t now        = os_time_get_rt_ns();
         payload_t *payload = (payload_t *)packet;
         cycle_time         = payload->cycle;
         if (payload->type == PAYLOAD_TYPE_END) {
@@ -374,7 +320,7 @@ do_pong(options_t *opts)
         payload->type      = PAYLOAD_TYPE_DATA;
         payload->jitter    = now - last_recv_time - cycle_time;
         
-        ret = sendmsg(sockfd, &msg, 0);
+        ret = rt_socket_send_message(sock, &msg, 0);
         if (ret == -1) {
             perror("sendmsg");
             exit(1);
@@ -383,13 +329,17 @@ do_pong(options_t *opts)
         last_recv_time = now;
     }
 
-    close(sockfd);
+    rt_socket_destroy(sock);
 }
 
 static void
 do_ping(options_t *opts) 
 {
-    int sockfd = init_socket(opts->port, opts->interface);
+    rt_socket *sock = rt_socket_new(opts->interface, opts->port, RT_SOCKET_TYPE_UDP, true);
+    if (sock == NULL) {
+        fprintf(stderr, "Failed to create socket\n");
+        exit(1);
+    }
 
     char packet[128] = {0};
 
@@ -412,8 +362,8 @@ do_ping(options_t *opts)
     payload_t *payload = (payload_t *)packet;
     payload->type = PAYLOAD_TYPE_DATA;
 
-    int64_t start_time  = get_realtime_ns();
-    int64_t wakeup_time = normalize_time(start_time + 2 * NSER_PER_SEC);
+    int64_t start_time  = os_time_get_rt_ns();
+    int64_t wakeup_time = os_time_normalize_ts(start_time + 2 * NSER_PER_SEC);
 
     fprintf(stderr, "Start time:  %ld\n", start_time);
     fprintf(stderr, "Wakeup time: %ld\n", wakeup_time);
@@ -439,7 +389,7 @@ do_ping(options_t *opts)
 
         memset(packet, 0, sizeof(packet));
         memset(packet, 'a', opts->packet_size);
-        int64_t now = get_realtime_ns();
+        int64_t now = os_time_get_rt_ns();
         if (num_latencies == opts->num_packets - 1) {
             fprintf(stderr, "Sending end packet\n");
             payload->type = PAYLOAD_TYPE_END;
@@ -453,14 +403,14 @@ do_ping(options_t *opts)
         payload->seqno     = num_latencies + 1;
 
         // printf("Sending packet %ld at %ld\n", payload->seqno, now);
-        ret = sendmsg(sockfd, &msg, 0);
+        ret = rt_socket_send_message(sock, &msg, 0);
         if (ret == -1) {
             perror("sendmsg");
             exit(1);
         }
 
         memset(packet, 0, sizeof(packet));
-        ret = recvmsg(sockfd, &msg, 0);
+        ret = rt_socket_receive_message(sock, &msg, 0);
         if (ret == -1) {
             perror("recvmsg");
             exit(1);
@@ -471,7 +421,7 @@ do_ping(options_t *opts)
             continue;
         }
 
-        rtt_latencies[num_latencies]     = get_realtime_ns() - now;
+        rtt_latencies[num_latencies]     = os_time_get_rt_ns() - now;
         jitter_latencies[num_latencies]  = payload->jitter;
         num_latencies                   += 1;        
     }
@@ -527,12 +477,28 @@ do_ping(options_t *opts)
     fprintf(stderr, "Jitter Max: %ld\n", max_jitter);
     fprintf(stderr, "Jitter Avg: %ld\n", avg_jitter);
 
-    close(sockfd);
+    fprintf(stderr, "Done\n");
+    rt_socket_destroy(sock);
 }
 
 int 
 main(int argc, char *argv[]) 
 {
+
+#if 0
+    (void)argc;
+    char *ifname = argv[1];
+
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd == -1) {
+        perror("socket");
+        exit(1);
+    }
+
+    if (socket_enable_timestamping(sockfd, ifname) == -1) {
+        exit(1);
+    }
+#else
     // Parse command line options
     int opt;
     while ((opt = getopt(argc, argv, "p:P:r:i:d:o:s:c:n:C:T:v")) != -1) {
@@ -585,40 +551,45 @@ main(int argc, char *argv[])
     }
 
     // Set CPU affinity
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
 
-    char *cpus  = options.cpus;
-    char *token = strtok(cpus, ",");
-    while (token != NULL) {
-        int cpu = atoi(token);
-        CPU_SET(cpu, &cpuset);
-        token = strtok(NULL, ",");
-    }
+        int cpus[128];
+        usize ncpus = 0;
+        char *cpus_str  = options.cpus;
+        char *token = strtok(cpus_str, ",");
+        while (token != NULL) {
+            int cpu = atoi(token);
+            cpus[ncpus++] = cpu;
+            token = strtok(NULL, ",");
+        }
 
-    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == -1) {
-        perror("sched_setaffinity");
-        exit(1);
+        if (os_sched_set_affinity(cpus, ncpus) < 0) {
+            perror("os_sched_set_affinity");
+            exit(1);
+        }
     }
 
     // Set scheduling policy
-    int policy;
-    if (strcmp(options.sched_policy, "rr") == 0) {
-        policy = SCHED_RR;
-    } else if (strcmp(options.sched_policy, "fifo") == 0) {
-        policy = SCHED_FIFO;
-    } else {
-        fprintf(stderr, "Invalid scheduling policy: %s\n", options.sched_policy);
-        exit(1);
+    {
+        os_sched_policy policy;
+        if (strcmp(options.sched_policy, "rr") == 0) {
+            policy = OS_SCHED_RR;
+        } else if (strcmp(options.sched_policy, "fifo") == 0) {
+            policy = OS_SCHED_FIFO;
+        } else {
+            fprintf(stderr, "Invalid scheduling policy: %s\n", options.sched_policy);
+            exit(1);
+        }
+
+        os_sched_set_policy(policy, options.sched_prio);
     }
 
-    set_policy(policy, options.sched_prio);
-
     // Lock memory
-    mlockall(MCL_CURRENT | MCL_FUTURE);
+    os_vm_lockall();
 
     fprintf(stderr, "Role: %s\n", options.role_name);
-
     options.role_id = role_name_to_id(options.role_name); 
     if (options.role_id == -1) {
         fprintf(stderr, "Invalid role: %s\n", options.role_name);
@@ -635,5 +606,6 @@ main(int argc, char *argv[])
         do_pong(&options);
     } 
 
+#endif
     return 0;
 }

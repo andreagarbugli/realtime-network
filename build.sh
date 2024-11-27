@@ -5,12 +5,14 @@ if [ ! -d "build" ]; then
 fi
 
 CC=gcc
-CFLAGS="-Wall -Wextra -Werror -pedantic -std=c99"
 LDFLAGS="-lm"
 
+CFLAGS="-Wall -Wextra -Werror -pedantic -std=c99"
+# disable some warnings
+CFLAGS="$CFLAGS -Wno-unused-function"
 # optimization flags
-CFLAGS="$CFLAGS -O3 -march=native -flto -fwhole-program"
+CFLAGS="$CFLAGS -g -march=native -flto -fwhole-program"
 
 cd build
-$CC $CFLAGS ../main.c $LDFLAGS -o main
+$CC $CFLAGS ../src/rtn_main.c -I../src $LDFLAGS -o main
 cd ..
