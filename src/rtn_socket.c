@@ -1,7 +1,17 @@
 #include "rtn_socket.h"
+#include "rtn_stats.h"
+
+static void 
+init_ifreq(struct ifreq *ifr, void *data, const char *ifname)
+{
+    memset(ifr, 0, sizeof(*ifr));
+    strncpy(ifr->ifr_name, ifname, IFNAMSIZ-1);
+    ifr->ifr_data = data;
+}
 
 static int
-rt_socket_check_timestamping(int sockfd, const char *ifname) {
+rtn_socket_check_timestamping(int sockfd, const char *ifname) 
+{
     struct ifreq ifr;
     struct hwtstamp_config config;
     
@@ -132,63 +142,13 @@ rt_socket_check_timestamping(int sockfd, const char *ifname) {
     return 0;
 }
 
-static int 
-rt_socket_enable_timestamping(int sockfd, const char *ifname)
-{
+static rtn_socket *
+rtn_socket_new(const char *ifname, int port, rtn_socket_type type)
+{   
     int res = 0;
-    // Enable timestamping
-    //  Timestamping generation flags:
-    //   - SOF_TIMESTAMPING_RX_HARDWARE: network adapter provides hardware 
-    //                                   timestamps at receive
-    //   - SOF_TIMESTAMPING_RX_SOFTWARE: RX timestamp when data enters the kernel 
-    //                                   (just after the device driver has processed it)
-    //   - SOF_TIMESTAMPING_TX_HARDWARE: network adapter provides hardware
-    //                                   timestamps at transmit
-    //   - SOF_TIMESTAMPING_TX_SOFTWARE: TX timestamp when data leaves the kernel.
-    //   - SOF_TIMESTAMPING_TX_SCHED:    Prio entering the packet scheduler.
-    //
-    //  Timestamping reporting flags:
-    //   - SOF_TIMESTAMPING_SOFTWARE:     report any software timestamps
-    //   - SOF_TIMESTAMPING_RAW_HARDWARE: report raw hardware timestamps
-    //
-    //  Timestamping options:
-    //   - SOF_TIMESTAMPING_OPT_ID:       include a unique identifier for each timestamp
-    //   - SOF_TIMESTAMPING_OPT_TSONLY:   kernel return ts as `cmsg` alongside empty packet
-    //   - SOF_TIMESTAMPING_OPT_PKTINFO:  enable SCM_TIMESTAMPING_PKTINFO control message
-    //   - SOF_TIMESTAMPING_OPT_TX_SWHW:  report both software and hardware TX timestamps
-    int ts_flags = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RX_SOFTWARE         
-                 | SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_TX_SOFTWARE          
-                 | SOF_TIMESTAMPING_TX_SCHED;   
-    ts_flags |= SOF_TIMESTAMPING_SOFTWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
-    ts_flags |= SOF_TIMESTAMPING_OPT_ID | SOF_TIMESTAMPING_OPT_TSONLY
-             | SOF_TIMESTAMPING_OPT_PKTINFO | SOF_TIMESTAMPING_OPT_TX_SWHW;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &ts_flags, sizeof(ts_flags)) == -1) {
-        perror("setsockopt");
-        res = -1;
-    }
 
-
-    struct hwtstamp_config config = {
-        .tx_type   = HWTSTAMP_TX_ON,
-        .rx_filter = HWTSTAMP_FILTER_ALL,
-    };
-    struct ifreq ifr = {
-        .ifr_data = (void *)&config,
-    };
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
-    if (ioctl(sockfd, SIOCSHWTSTAMP, &ifr) == -1) {
-        perror("ioctl(SIOCSHWTSTAMP)");
-        return -1;
-    }
-
-    return res;
-}
-
-static rt_socket *
-rt_socket_new(const char *ifname, int port, rt_socket_type type, bool ts_on)
-{
-    int socktype = s_rt_socket_type_flags[type];
-    fprintf(stderr, "[debug] Opening socket type %s\n", s_rt_socket_type_str[type]);
+    int socktype = s_rtn_socket_type_flags[type];
+    fprintf(stderr, "[debug] Opening socket type %s\n", s_rtn_socket_type_str[type]);
 
     int sockfd = socket(AF_INET, socktype, 0);
     if (sockfd == -1) {
@@ -196,45 +156,43 @@ rt_socket_new(const char *ifname, int port, rt_socket_type type, bool ts_on)
         goto exit_socket_error;
     }
 
-    struct sockaddr_in addr;
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    struct sockaddr_in addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(port),
+        .sin_addr.s_addr = INADDR_ANY,
+    };
 
-    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+    res = bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
+    if (res < 0) {
         perror("bind");
         goto exit_cleanup;
     }
 
     // resuse address
     int optval = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
+    res = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    if (res < 0) {
         perror("setsockopt");
         goto exit_cleanup;
     }
 
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) == -1) {
+    res = setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+    if (res < 0) {
         perror("setsockopt");
         goto exit_cleanup;
-    }
-
-    if (ts_on) {
-        if (rt_socket_enable_timestamping(sockfd, ifname) == -1) {
-            goto exit_cleanup;
-        }
     }
 
     if (ifname) {
         struct ifreq ifr;
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
-        if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)) == -1) {
+        init_ifreq(&ifr, NULL, ifname);
+        res = setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr));
+        if (res < 0) {
             perror("setsockopt");
             goto exit_cleanup;
         }
     }
 
-    rt_socket *sock = malloc(sizeof(rt_socket));
+    rtn_socket *sock = malloc(sizeof(rtn_socket));
     sock->fd     = sockfd;
     sock->port   = port;
     sock->ifname = ifname;
@@ -247,7 +205,7 @@ exit_socket_error:
 }
 
 static void 
-rt_socket_destroy(rt_socket *sock)
+rtn_socket_destroy(rtn_socket *sock)
 {
     close(sock->fd);
     free(sock);
@@ -256,55 +214,196 @@ rt_socket_destroy(rt_socket *sock)
 ////////////////////////////////////////////////////////////////////////////////
 // # Receive and Send
 static int
-rt_socket_send_message(rt_socket *sock, struct msghdr *msg, int flags)
+rtn_socket_send_message(rtn_socket *sock, void *data, usize datasize, int flags)
 {
-    return sendmsg(sock->fd, msg, flags);   
+    struct iovec iov = {
+        .iov_base = data,
+        .iov_len  = datasize,
+    };
+    struct msghdr msg = {
+        .msg_name    = &sock->daddr,
+        .msg_namelen = sock->daddr_len,
+        .msg_iov     = &iov,
+        .msg_iovlen  = 1,
+    };
+
+    char control[128] = {0};
+    if (sock->use_txtime) {
+        msg.msg_control    = control;
+        msg.msg_controllen = sizeof(control);
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type  = SCM_TXTIME;
+        cmsg->cmsg_len   = CMSG_LEN(sizeof(u64));
+
+        *((u64 *)CMSG_DATA(cmsg)) = sock->txtime;
+    }
+
+    return sendmsg(sock->fd, &msg, flags);   
 }
 
 static int
-rt_socket_receive_message(rt_socket *sock, struct msghdr *msg, int flags)
+rtn_socket_receive_message(rtn_socket *sock, void *data, usize datasize, rtn_pkt_stat *pstat, int flags)
 {
-    return recvmsg(sock->fd, msg, flags);
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    struct iovec iov = {
+        .iov_base = data,
+        .iov_len  = datasize,
+    };
+    struct msghdr mhdr = {
+        .msg_name    = &addr,
+        .msg_namelen = addrlen,
+        .msg_iov     = &iov,
+        .msg_iovlen  = 1,
+    };
+
+    char control[128] = {0};
+
+    if (pstat) {
+        mhdr.msg_control    = control;
+        mhdr.msg_controllen = sizeof(control);
+    }
+    
+    int res = recvmsg(sock->fd, &mhdr, flags);
+    if (res > 0 && pstat) {        
+        struct scm_timestamping *scm_ts = NULL;
+        struct cmsghdr *cmsg            = NULL;
+        for (cmsg = CMSG_FIRSTHDR(&mhdr); cmsg != NULL; cmsg = CMSG_NXTHDR(&mhdr, cmsg)) 
+        {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
+                scm_ts = (struct scm_timestamping *)CMSG_DATA(cmsg);
+
+                i64 sw = scm_ts->ts[0].tv_sec * NSEC_PER_SEC + scm_ts->ts[0].tv_nsec;
+                i64 hw = scm_ts->ts[2].tv_sec * NSEC_PER_SEC + scm_ts->ts[2].tv_nsec;
+
+                pstat->rx_tstamps.hw_ts = hw;
+                pstat->rx_tstamps.sw_ts = sw;
+            }
+        }   
+    }
+
+    return res;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// # Options
 static int
-rt_socket_errqueue_tx(rt_socket *sock)
+rnt_socket_set_priority(rtn_socket *sock, int prio)
 {
-    struct msghdr msg;
-    struct iovec iov;
-    char buffer[1024];
-    char control[1024];
-    struct cmsghdr *cmsg;
-    // struct sock_extended_err *err;
-    struct timespec *ts = NULL;
+    struct sched_param sched_param = {
+        .sched_priority = prio,
+    };
 
-    memset(&msg, 0, sizeof(msg));
-    memset(buffer, 0, sizeof(buffer));
-    memset(control, 0, sizeof(control));
-
-    // Set up message header
-    iov.iov_base = buffer;
-    iov.iov_len = sizeof(buffer);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-
-    // Receive message from error queue
-    if (recvmsg(sock->fd, &msg, MSG_ERRQUEUE) == -1) {
-        perror("recvmsg");
+    int res = setsockopt(sock->fd, SOL_SOCKET, SO_PRIORITY, &sched_param, sizeof(sched_param));
+    if (res < 0) {
+        perror("setsockopt(SO_PRIORITY)");
         return -1;
     }
 
-    // Iterate through control messages
-    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
-            ts = (struct timespec *)CMSG_DATA(cmsg);
-            printf("Hardware timestamp: %ld.%09ld seconds\n", ts[2].tv_sec, ts[2].tv_nsec);
-            printf("Software timestamp: %ld.%09ld seconds\n", ts[0].tv_sec, ts[0].tv_nsec);
-            printf("Raw hardware timestamp: %ld.%09ld seconds\n", ts[1].tv_sec, ts[1].tv_nsec);
-        }
+    return res;
+}
+
+static int 
+rtn_socket_opt_set_txtimestamp(rtn_socket *sock)
+{
+    struct sock_txtime sk_txtime = {
+        .clockid = CLOCK_TAI,
+        .flags   = 0,
+    };
+
+    int res = setsockopt(sock->fd, SOL_SOCKET, SO_TXTIME, &sk_txtime, sizeof(sk_txtime));
+    if (res < 0) {
+        perror("setsockopt(SO_TXTIME)");
+        return -1;
     }
 
-    return 0;
+    sock->use_txtime = true;
+    return res;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// # Timestamping
+static int 
+rtn_socket_enable_timestamping(rtn_socket *sock, const char *ifname)
+{
+    int res, opt;
+    int sockfd = sock->fd;
+
+    int ts_flags = SOF_TIMESTAMPING_RX_HARDWARE     // [GF] network adapter provides hardware timestamps at receive
+                 | SOF_TIMESTAMPING_RX_SOFTWARE     // [GF] RX timestamp when data enters the kernel (just after the device driver has processed it)
+                 | SOF_TIMESTAMPING_TX_HARDWARE     // [GF] network adapter provides hardware timestamps at transmit
+                 | SOF_TIMESTAMPING_TX_SOFTWARE     // [GF] TX timestamp when data leaves the kernel
+                 | SOF_TIMESTAMPING_TX_SCHED        // [GF] before entering the packet scheduler
+                 | SOF_TIMESTAMPING_SOFTWARE        // [RF] report any software timestamps
+                 | SOF_TIMESTAMPING_RAW_HARDWARE    // [RF] report raw hardware timestamps
+                 | SOF_TIMESTAMPING_OPT_ID          // [OF] include a unique identifier for each timestamp
+                 | SOF_TIMESTAMPING_OPT_TX_SWHW;    // [OF] report both software and hardware TX timestamps
+
+    res = setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &ts_flags, sizeof(ts_flags));
+    if (res < 0) {
+        perror("setsockopt");
+        res = -1;
+    }
+
+    int tx_type                   = HWTSTAMP_TX_ON;
+    int rx_filter                 = HWTSTAMP_FILTER_ALL;
+    struct hwtstamp_config config = { .tx_type = tx_type, .rx_filter = rx_filter };
+
+    struct ifreq ifr;
+    init_ifreq(&ifr, &config, ifname);
+    res = ioctl(sockfd, SIOCSHWTSTAMP, &ifr);
+    if (res < 0) {
+        perror("ioctl(SIOCSHWTSTAMP)");
+        return -1;
+    }
+
+    opt = 1;
+    res = setsockopt(sockfd, SOL_SOCKET, SO_SELECT_ERR_QUEUE, &opt, sizeof(opt));
+    if (res < 0) {
+        perror("setsockopt(SO_SELECT_ERR_QUEUE)");
+        return -1;
+    }
+
+    // check timestamping
+    socklen_t optlen = sizeof(ts_flags);
+    res = getsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &ts_flags, &optlen);
+    if (res < 0) {
+        perror("getsockopt");
+        return -1;
+    }
+
+    // char printbuf[1024];
+    // usize written = snprintf(printbuf, sizeof(printbuf), "Timestamping flags: ");
+
+    // if (ts_flags & SOF_TIMESTAMPING_RX_HARDWARE)   written += snprintf(printbuf + written, sizeof(printbuf) - written, "RX_HARDWARE ");
+    // if (ts_flags & SOF_TIMESTAMPING_RX_SOFTWARE)   written += snprintf(printbuf + written, sizeof(printbuf) - written, "RX_SOFTWARE ");
+    // if (ts_flags & SOF_TIMESTAMPING_TX_HARDWARE)   written += snprintf(printbuf + written, sizeof(printbuf) - written, "TX_HARDWARE ");
+    // if (ts_flags & SOF_TIMESTAMPING_TX_SOFTWARE)   written += snprintf(printbuf + written, sizeof(printbuf) - written, "TX_SOFTWARE ");
+    // if (ts_flags & SOF_TIMESTAMPING_TX_SCHED)      written += snprintf(printbuf + written, sizeof(printbuf) - written, "TX_SCHED ");
+    // if (ts_flags & SOF_TIMESTAMPING_SOFTWARE)      written += snprintf(printbuf + written, sizeof(printbuf) - written, "SOFTWARE ");
+    // if (ts_flags & SOF_TIMESTAMPING_RAW_HARDWARE)  written += snprintf(printbuf + written, sizeof(printbuf) - written, "RAW_HARDWARE ");
+    // if (ts_flags & SOF_TIMESTAMPING_OPT_ID)        written += snprintf(printbuf + written, sizeof(printbuf) - written, "OPT_ID ");
+    // if (ts_flags & SOF_TIMESTAMPING_OPT_TX_SWHW)   written += snprintf(printbuf + written, sizeof(printbuf) - written, "OPT_TX_SWHW ");
+
+    // printf("%s\n", printbuf);
+
+    return res;
+}
+
+static int
+rtn_socket_disable_timestamping(rtn_socket *sock)
+{
+    int res = 0;
+    int sockfd = sock->fd;
+
+    int ts_flags = 0;
+    res = setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &ts_flags, sizeof(ts_flags));
+    if (res < 0) {
+        perror("setsockopt");
+        res = -1;
+    }
+
+    return res;
 }

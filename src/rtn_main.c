@@ -2,610 +2,304 @@
 // # RT Network Application
 // 
 // ## Todos
+// - [ ] Add the `rtn_socket` to the `rtn_options` header file.
 
 ////////////////////////////////////////////////////////////////////////////////
 // # Includes
 #include "rtn_base.h"
+#include "rtn_client.h"
+#include "rtn_log.h"
+#include "rtn_options.h"
+#include "rtn_packet.h"
+#include "rtn_ping.h"
 #include "rtn_socket.h"
+#include "rtn_stats.h"
+#include "rtn_server.h"
+#include "rtn_txrx.h"
 
 // # C Files
 #include "rtn_socket.c"
 
 ////////////////////////////////////////////////////////////////////////////////
-// # Application
-enum {
-    ROLE_TALKER   = 0,
-    ROLE_LISTENER = 1,
-    ROLE_PING     = 2,
-    ROLE_PONG     = 3,
+// # Globals
+
+static options_t g_opts = {
+    .sched_policy = "fifo",
+    .sched_prio   = 80,
+    .role_name    = "tx",
+    .interface    = "eth0",
+    .port         = 9999,
+    .dest_ip      = "10.0.10.20",
+    .packet_size  = 256,
+    .cpus         = "1",
+    .cycle_time   = 1000000,  // 1 ms
+    .num_packets  = 1000,
+    .verbose      = false,
+    .save_file    = false,
+    .log_level    = "info",
 };
 
-static const char *g_roleid_to_string[] = {
-    [ROLE_TALKER]   = "talker",
-    [ROLE_LISTENER] = "listener",
-    [ROLE_PING]     = "ping",
-    [ROLE_PONG]     = "pong",
-};
-
-static int 
-role_name_to_id(const char *role) 
-{
-    for (size_t i = 0; i < ARRAY_SIZE(g_roleid_to_string); i++) {
-        if (strcmp(role, g_roleid_to_string[i]) == 0) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
-typedef struct options options_t;
-struct options {
-    char    *sched_policy;
-    int      sched_prio;
-    char    *role_name;
-    int      role_id;
-    char    *interface;
-    int      port;
-    char    *dest_ip;
-    int      packet_size;       // in bytes
-    char    *cpus;              // CPU affinity: 0,1,2,3
-
-    uint64_t cycle_time;        // cycle time in nanoseconds
-	uint64_t num_packets;       // number of frames
-    uint64_t throttle;          // number of packets to discard before sending
-
-    bool     verbose;
-};
-
-enum {
-    PAYLOAD_TYPE_UNKNOWN = 0,
-    PAYLOAD_TYPE_DATA    = 1,
-    PAYLOAD_TYPE_END     = 2,
-};
-
-// static char *g_payload_type_names[] = {
-//     "UNKNOWN",
-//     "DATA",
-//     "END",
-// };
-
-typedef struct payload payload_t;
-struct payload {
-    int64_t    timestamp;
-    int64_t    cycle;
-    int64_t    jitter;
-    uint32_t   seqno;
-    uint8_t    type;
-};
+static char *usage_str = 
+    "Usage: %s [-p sched_policy] [-P sched_priority] [-r role] [-i interface]"
+    "[-d dest_ip] [-o port] [-s packet_size] [-c cpus] [-n num_packets] [-C cycle_time]\n";
 
 ////////////////////////////////////////////////////////////////////////////////
-// Globals
-
-#define MAX_NUM_PACKETS 10000000
-
-options_t options = {
-    .sched_policy   = "rr",
-    .sched_prio     = 98,
-    .role_id        = ROLE_TALKER,
-    .role_name      = "talker",
-    .interface      = "eth0",
-    .port           = 1234,
-    .dest_ip        = "10.0.10.20",
-    .packet_size    = 64,
-    .cpus           = "0",
-    
-    .cycle_time     = 1000000,  // 1 ms
-    .num_packets    = 1000,
-    .throttle       = 0,
-
-    .verbose        = false,
-};
-
-
-static void
-do_talker(options_t *options) 
-{
-    rt_socket *sock = rt_socket_new(options->interface, options->port, RT_SOCKET_TYPE_UDP, true);
-    if (sock == NULL) {
-        fprintf(stderr, "Failed to create socket\n");
-        exit(1);
-    }
-
-    char packet[128];
-
-    // send using sendmsg
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_family      = AF_INET;
-    dest_addr.sin_port        = htons(options->port);
-    dest_addr.sin_addr.s_addr = inet_addr(options->dest_ip);
-
-    struct iovec iov;
-    iov.iov_base = packet;
-    iov.iov_len  = sizeof(packet);
-
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_name    = &dest_addr;
-    msg.msg_namelen = sizeof(dest_addr);
-    msg.msg_iov     = &iov;
-    msg.msg_iovlen  = 1;
-
-    payload_t *payload = (payload_t *)packet;
-    payload->type = PAYLOAD_TYPE_DATA;
-
-    int64_t start_time  = os_time_get_rt_ns();
-    int64_t wakeup_time = os_time_normalize_ts(start_time + 2 * NSER_PER_SEC);
-
-    fprintf(stderr, "Start time:  %ld\n", start_time);
-    fprintf(stderr, "Wakeup time: %ld\n", wakeup_time);
-
-    // send 1 message using sendmsg and then sleep using clock_nanosleep to wait for next cycle
-    int ret;
-    struct timespec sleep_ts;
-    bool stop = false;
-    while (!stop) {
-        sleep_ts.tv_sec  = wakeup_time / NSER_PER_SEC;
-        sleep_ts.tv_nsec = wakeup_time % NSER_PER_SEC;
-
-        ret = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &sleep_ts, NULL);
-        if (ret == -1) {
-            perror("clock_nanosleep");
-            exit(1);
-        }
-
-        wakeup_time += options->cycle_time;
-
-        if (payload->seqno == options->num_packets) {
-            payload->type = PAYLOAD_TYPE_END;
-            stop = true;
-        }
-
-        int64_t now         = os_time_get_rt_ns();
-        payload->timestamp  = now;
-        payload->seqno     += 1;
-
-        // printf("Sending packet %ld at %ld\n", payload->seqno, now);
-        ret = rt_socket_send_message(sock, &msg, 0);
-        if (ret == -1) {
-            perror("sendmsg");
-            exit(1);
-        }
-
-        // try to read from error queue
-        rt_socket_errqueue_tx(sock);
-    }
-
-    rt_socket_destroy(sock);
-}
-
-static void
-do_listener(options_t *options) 
-{
-    uint64_t *latencies  = malloc(MAX_NUM_PACKETS * sizeof(uint64_t));
-    size_t num_latencies = 0;
-
-    rt_socket *sock = rt_socket_new(options->interface, options->port, RT_SOCKET_TYPE_UDP, true);
-    if (sock == NULL) {
-        fprintf(stderr, "Failed to create socket\n");
-        exit(1);
-    }
-
-    char *packet = malloc(options->packet_size);
-    if (packet == NULL) {
-        perror("malloc");
-        exit(1);
-    }
-
-    // recv using recvmsg
-    struct sockaddr_in src_addr;
-    socklen_t src_addr_len = sizeof(src_addr);
-
-    struct iovec iov;
-    iov.iov_base = packet;
-    iov.iov_len  = options->packet_size;
-
-    struct msghdr msg;
-    msg.msg_name    = &src_addr;
-    msg.msg_namelen = src_addr_len;
-    msg.msg_iov     = &iov;
-    msg.msg_iovlen  = 1;
-
-    fprintf(stderr, "Listening on port %d\n", options->port);
-    int ret;
-    int stop = 0;
-    while (!stop) {
-        ret = rt_socket_receive_message(sock, &msg, 0);
-        if (ret == -1) {
-            perror("recvmsg");
-            exit(1);
-        }
-
-        payload_t *payload = (payload_t *)packet;
-        if (payload->type == PAYLOAD_TYPE_END) {
-            stop = 1;
-        }
-
-        int64_t now = os_time_get_rt_ns();
-        uint64_t latency = now - payload->timestamp;
-        latencies[num_latencies++] = latency;
-    }
-
-    // calculate statistics
-    uint64_t min_latency = UINT64_MAX;
-    uint64_t max_latency = 0;
-    uint64_t avg_latency = 0;
-    for (size_t i = 0; i < num_latencies; i++) {
-        uint64_t latency = latencies[i];
-        if (latency < min_latency) {
-            min_latency = latency;
-        }
-        if (latency > max_latency) {
-            max_latency = latency;
-        }
-        avg_latency += latency;
-    }
-
-    avg_latency /= num_latencies;
-
-    fprintf(stderr, "Peer disconnected, received %ld packets\n", num_latencies);
-    fprintf(stderr, "Min latency: %ld\n", min_latency);
-    fprintf(stderr, "Max latency: %ld\n", max_latency);
-    fprintf(stderr, "Avg latency: %ld\n", avg_latency); 
-
-    if (options->verbose) {        
-        fprintf(stderr, "Saving results\n");
-        printf("id, latencies\n");
-        for (size_t i = 0; i < num_latencies; i++) {
-            printf("%ld, %ld\n", i, latencies[i]);
-        }
-    }
-
-    fprintf(stderr, "Done\n");
-    rt_socket_destroy(sock);
-}
-
-static void
-do_pong(options_t *opts) 
-{
-    rt_socket *sock = rt_socket_new(opts->interface, opts->port, RT_SOCKET_TYPE_UDP, true);
-    if (sock == NULL) {
-        fprintf(stderr, "Failed to create socket\n");
-        exit(1);
-    }
-
-    char *packet = malloc(opts->packet_size);
-    if (packet == NULL) {
-        perror("malloc");
-        exit(1);
-    }
-
-    // recv using recvmsg
-    struct sockaddr_in src_addr;
-    socklen_t src_addr_len = sizeof(src_addr);
-
-    struct iovec iov;
-    iov.iov_base = packet;
-    iov.iov_len  = opts->packet_size;
-
-    struct msghdr msg;
-    msg.msg_name    = &src_addr;
-    msg.msg_namelen = src_addr_len;
-    msg.msg_iov     = &iov;
-    msg.msg_iovlen  = 1;
-
-    fprintf(stderr, "Listening on port %d\n", opts->port);
-
-    int64_t cycle_time     = 0;
-    int64_t last_recv_time = 0;
-    int ret;
-    int stop = 0;
-    while (!stop) {
-        ret = rt_socket_receive_message(sock, &msg, 0);
-        if (ret == -1) {
-            perror("recvmsg");
-            exit(1);
-        }
-
-        int64_t now        = os_time_get_rt_ns();
-        payload_t *payload = (payload_t *)packet;
-        cycle_time         = payload->cycle;
-        if (payload->type == PAYLOAD_TYPE_END) {
-            fprintf(stderr, "Received end packet\n");
-            // stop = 1;
-        } 
-        
-        memset(packet, 'a', opts->packet_size);
-        payload->timestamp = now;
-        payload->type      = PAYLOAD_TYPE_DATA;
-        payload->jitter    = now - last_recv_time - cycle_time;
-        
-        ret = rt_socket_send_message(sock, &msg, 0);
-        if (ret == -1) {
-            perror("sendmsg");
-            exit(1);
-        }
-
-        last_recv_time = now;
-    }
-
-    rt_socket_destroy(sock);
-}
-
-static void
-do_ping(options_t *opts) 
-{
-    rt_socket *sock = rt_socket_new(opts->interface, opts->port, RT_SOCKET_TYPE_UDP, true);
-    if (sock == NULL) {
-        fprintf(stderr, "Failed to create socket\n");
-        exit(1);
-    }
-
-    char packet[128] = {0};
-
-    // send using sendmsg
-    struct sockaddr_in dest_addr = {0};
-    dest_addr.sin_family      = AF_INET;
-    dest_addr.sin_port        = htons(opts->port);
-    dest_addr.sin_addr.s_addr = inet_addr(opts->dest_ip);
-
-    struct iovec iov = {0};
-    iov.iov_base = packet;
-    iov.iov_len  = opts->packet_size;
-
-    struct msghdr msg = {0};
-    msg.msg_name    = &dest_addr;
-    msg.msg_namelen = sizeof(dest_addr);
-    msg.msg_iov     = &iov;
-    msg.msg_iovlen  = 1;
-
-    payload_t *payload = (payload_t *)packet;
-    payload->type = PAYLOAD_TYPE_DATA;
-
-    int64_t start_time  = os_time_get_rt_ns();
-    int64_t wakeup_time = os_time_normalize_ts(start_time + 2 * NSER_PER_SEC);
-
-    fprintf(stderr, "Start time:  %ld\n", start_time);
-    fprintf(stderr, "Wakeup time: %ld\n", wakeup_time);
-
-    int64_t *rtt_latencies    = malloc(MAX_NUM_PACKETS * sizeof(uint64_t));
-    int64_t *jitter_latencies = malloc(MAX_NUM_PACKETS * sizeof(uint64_t));
-    uint64_t num_latencies    = 0;
-    
-    int ret;
-    struct timespec sleep_ts;
-    bool stop = false;
-    while (!stop) {
-        sleep_ts.tv_sec  = wakeup_time / NSER_PER_SEC;
-        sleep_ts.tv_nsec = wakeup_time % NSER_PER_SEC;
-
-        ret = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &sleep_ts, NULL);
-        if (ret == -1) {
-            perror("clock_nanosleep");
-            exit(1);
-        }
-
-        wakeup_time += opts->cycle_time;
-
-        memset(packet, 0, sizeof(packet));
-        memset(packet, 'a', opts->packet_size);
-        int64_t now = os_time_get_rt_ns();
-        if (num_latencies == opts->num_packets - 1) {
-            fprintf(stderr, "Sending end packet\n");
-            payload->type = PAYLOAD_TYPE_END;
-            stop          = true;
-        } else {
-            payload->type      = PAYLOAD_TYPE_DATA;
-        }
-
-        payload->cycle     = opts->cycle_time;
-        payload->timestamp = now;
-        payload->seqno     = num_latencies + 1;
-
-        // printf("Sending packet %ld at %ld\n", payload->seqno, now);
-        ret = rt_socket_send_message(sock, &msg, 0);
-        if (ret == -1) {
-            perror("sendmsg");
-            exit(1);
-        }
-
-        memset(packet, 0, sizeof(packet));
-        ret = rt_socket_receive_message(sock, &msg, 0);
-        if (ret == -1) {
-            perror("recvmsg");
-            exit(1);
-        }
-
-        if (opts->throttle > 0) {
-            opts->throttle -= 1;
-            continue;
-        }
-
-        rtt_latencies[num_latencies]     = os_time_get_rt_ns() - now;
-        jitter_latencies[num_latencies]  = payload->jitter;
-        num_latencies                   += 1;        
-    }
-
-    // calculate statistics
-    uint64_t min_rtt = UINT64_MAX;
-    uint64_t max_rtt = 0;
-    uint64_t avg_rtt = 0;
-    for (uint64_t i = 0; i < num_latencies; i++) {
-        uint64_t rtt = rtt_latencies[i];
-        if (rtt < min_rtt) {
-            min_rtt = rtt;
-        }
-        if (rtt > max_rtt) {
-            max_rtt = rtt;
-        }
-        avg_rtt += rtt;
-    }
-
-    avg_rtt /= num_latencies;
-
-    // jitter can be negative
-    int64_t min_jitter = INT64_MAX;
-    int64_t max_jitter = INT64_MIN;
-    int64_t avg_jitter = 0;
-    for (uint64_t i = 0; i < num_latencies; i++) {
-        int64_t jitter = jitter_latencies[i];
-        if (jitter < min_jitter) {
-            min_jitter = jitter;
-        }
-        if (jitter > max_jitter) {
-            max_jitter = jitter;
-        }
-        avg_jitter += jitter;
-    }
-
-    avg_jitter /= (int64_t)num_latencies;
-
-    if (opts->verbose) {     
-        fprintf(stderr, "Saving results\n");
-        printf("id, rtt, jitter, cycle_time\n");
-        for (uint64_t i = 0; i < num_latencies; i++) {
-            printf("%ld, %ld, %ld, %ld\n", i, rtt_latencies[i], jitter_latencies[i], opts->cycle_time);
-        }
-    }
-
-    fprintf(stderr, "Peer disconnected, received %ld packets\n", num_latencies);
-    fprintf(stderr, "RTT Min: %ld\n", min_rtt);
-    fprintf(stderr, "RTT Max: %ld\n", max_rtt);
-    fprintf(stderr, "RTT Avg: %ld\n", avg_rtt);
-
-    fprintf(stderr, "Jitter Min: %ld\n", min_jitter);
-    fprintf(stderr, "Jitter Max: %ld\n", max_jitter);
-    fprintf(stderr, "Jitter Avg: %ld\n", avg_jitter);
-
-    fprintf(stderr, "Done\n");
-    rt_socket_destroy(sock);
-}
-
+// # Main
 int 
 main(int argc, char *argv[]) 
 {
-
-#if 0
-    (void)argc;
-    char *ifname = argv[1];
-
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd == -1) {
-        perror("socket");
-        exit(1);
-    }
-
-    if (socket_enable_timestamping(sockfd, ifname) == -1) {
-        exit(1);
-    }
-#else
-    // Parse command line options
+    ////////////////////////////////////////////////////////////////////////////
+    // Initialization & Command Line Parsing
     int opt;
-    while ((opt = getopt(argc, argv, "p:P:r:i:d:o:s:c:n:C:T:v")) != -1) {
+    while ((opt = getopt(argc, argv, "p:P:r:i:d:o:s:c:n:C:l:vfha")) != -1) {
         switch (opt) {
-            case 'p':
-                options.sched_policy = optarg;
-                break;
-            case 'P':
-                options.sched_prio = atoi(optarg);
-                break;
-            case 'r':
-                options.role_name = optarg;
-                break;
-            case 'i':
-                options.interface = optarg;
-                break;
-            case 'd':
-                options.dest_ip = optarg;
-                break;
-            case 'o':
-                options.port = atoi(optarg);
-                break;
-            case 's':
-                options.packet_size = atoi(optarg);
-                break;
-            case 'c':
-                options.cpus = optarg;
-                break;
-            case 'n':
-                options.num_packets = atoll(optarg);
-                break;
-            case 'C':
-                options.cycle_time = atoll(optarg);
-                break;
-            case 'T':
-                options.throttle = atoll(optarg);
-                break;
-            case 'v':
-                options.verbose = true;
-                break;
+            case 'p': g_opts.sched_policy = optarg;        break;
+            case 'P': g_opts.sched_prio   = atoi(optarg);  break;
+            case 'r': g_opts.role_name    = optarg;        break;
+            case 'i': g_opts.interface    = optarg;        break;
+            case 'd': g_opts.dest_ip      = optarg;        break;
+            case 'o': g_opts.port         = atoi(optarg);  break;
+            case 's': g_opts.packet_size  = atoi(optarg);  break;
+            case 'c': g_opts.cpus         = optarg;        break;
+            case 'n': g_opts.num_packets  = atoll(optarg); break;
+            case 'C': g_opts.cycle_time   = atoll(optarg); break;
+            case 'l': g_opts.log_level    = optarg;        break;
+            case 'v': g_opts.verbose      = true;          break;
+            case 'f': g_opts.save_file    = true;          break;
+            case 'a': g_opts.rt_app_test  = true;          break;
+            case 'h':
             default:
-                fprintf(stderr, "Usage: %s [-p sched_policy] [-P sched_priority] [-r role] [-i interface] [-d dest_ip] [-o port] [-s packet_size] [-c cpus] [-n num_packets] [-C cycle_time]\n", argv[0]);
+                fprintf(stderr, usage_str, argv[0]);
                 exit(1);
         }
     }
 
-    if (options.throttle >= options.num_packets) {
-        fprintf(stderr, "Throttle value must be less than number of packets\n");
+    // Get OS information
+    uname(&g_opts.os_info);
+
+    // Set the log level
+    int log_level = LOG_INFO;
+    if (cstr_eq(g_opts.log_level, "fatal"))   log_level = LOG_FATAL;
+    if (cstr_eq(g_opts.log_level, "error"))   log_level = LOG_ERROR;
+    if (cstr_eq(g_opts.log_level, "warn" ))   log_level = LOG_WARN;
+    if (cstr_eq(g_opts.log_level, "info" ))   log_level = LOG_INFO;
+    if (cstr_eq(g_opts.log_level, "debug"))   log_level = LOG_DEBUG;
+    if (cstr_eq(g_opts.log_level, "trace"))   log_level = LOG_TRACE;
+
+    logger_set_level(log_level);
+
+    if (g_opts.num_packets > MAX_NUM_PACKETS) {
+        error("Number of packets exceeds the maximum limit: %d\n", MAX_NUM_PACKETS);
+        exit(1);
+    }
+    
+    debug("Starting RT Network Application: %s\n", g_opts.role_name);
+    g_opts.role_id = role_name_to_id(g_opts.role_name); 
+    if (g_opts.role_id == -1) {
+        error("Invalid role: %s\n", g_opts.role_name);
         exit(1);
     }
 
-    // Set CPU affinity
-    {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-
-        int cpus[128];
-        usize ncpus = 0;
-        char *cpus_str  = options.cpus;
-        char *token = strtok(cpus_str, ",");
-        while (token != NULL) {
-            int cpu = atoi(token);
-            cpus[ncpus++] = cpu;
-            token = strtok(NULL, ",");
-        }
-
-        if (os_sched_set_affinity(cpus, ncpus) < 0) {
-            perror("os_sched_set_affinity");
-            exit(1);
-        }
+    if (g_opts.rt_app_test && g_opts.role_id != ROLE_PONG) {
+        error("Realtime application test is only for pong role\n");
+        exit(1);
     }
-
-    // Set scheduling policy
-    {
-        os_sched_policy policy;
-        if (strcmp(options.sched_policy, "rr") == 0) {
-            policy = OS_SCHED_RR;
-        } else if (strcmp(options.sched_policy, "fifo") == 0) {
-            policy = OS_SCHED_FIFO;
-        } else {
-            fprintf(stderr, "Invalid scheduling policy: %s\n", options.sched_policy);
-            exit(1);
-        }
-
-        os_sched_set_policy(policy, options.sched_prio);
-    }
-
+    
+    ////////////////////////////////////////////////////////////////////////////
     // Lock memory
     os_vm_lockall();
 
-    fprintf(stderr, "Role: %s\n", options.role_name);
-    options.role_id = role_name_to_id(options.role_name); 
-    if (options.role_id == -1) {
-        fprintf(stderr, "Invalid role: %s\n", options.role_name);
+    ////////////////////////////////////////////////////////////////////////////
+    // Create the socket used for the tests
+
+    rtn_socket *sock = rtn_socket_new(g_opts.interface, g_opts.port, RTN_SOCK_TYPE_UDP);
+    if (sock == NULL) {
+        error("Failed to create rtn_socket\n");
         exit(1);
     }
 
-    if (options.role_id == ROLE_TALKER) {
-        do_talker(&options);
-    } else if (options.role_id == ROLE_LISTENER) {
-        do_listener(&options);
-    } else if (options.role_id == ROLE_PING) {
-        do_ping(&options);
-    } else if (options.role_id == ROLE_PONG) {
-        do_pong(&options);
-    } 
+    struct sockaddr_in dest_addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(g_opts.port),
+        .sin_addr.s_addr = inet_addr(g_opts.dest_ip),
+    };
+    rtn_socket_set_dest_addr(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
+    rtn_socket_enable_timestamping(sock, g_opts.interface);
+
+    ////////////////////////////////////////////////////////////////////////////
+    // 
+
+    g_pkt_stats.stats = malloc(MAX_NUM_PACKETS * sizeof(rtn_pkt_stat));
+    if (g_pkt_stats.stats == NULL) {
+        error("Failed to allocate memory for packet stats\n");
+        exit(1);
+    }
+
+
+#define STAT_THREAD 1
+#if STAT_THREAD
+    pthread_t stats_thread;
+    stats_thread_args stats_args = {
+        .num_packets   = g_opts.num_packets,
+        .sock          = sock,
+        .sem_start     = &g_opts.sem_stats_start,
+    };
+    if (g_opts.role_id == ROLE_TX) 
+    {
+        // Initialize the semaphore
+        os_sem_init(&g_opts.sem_stats_start, 0, 0);
+
+        // The stats thread will read from the error queue and gather statistics
+        // only for the talker role.
+        // FIXME: Can we make it more generic?   
+        if (pthread_create(&stats_thread, NULL, stats_thread_fn, &stats_args) != 0) {
+            error("Failed to create stats thread\n");
+            exit(1);
+        }
+
+        // set the thread priority low to avoid affecting the main thread
+        os_thread_set_priority(stats_thread, OS_SCHED_FIFO, 1);
+    }
 #endif
+
+    {
+        // Set CPU affinity
+        pthread_t self = os_thread_self();
+
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+
+        int cpus[128]   = {0};
+        usize ncpus     = 0;
+        char *cpus_str  = g_opts.cpus;
+        char *token     = strtok(cpus_str, ",");
+
+        while (token != NULL) {
+            int cpu       = atoi(token);
+            cpus[ncpus++] = cpu;
+            token         = strtok(NULL, ",");
+        }
+
+        if (os_thread_set_affinity(self, cpus, ncpus) < 0) {
+            error("Failed to set CPU affinity\n");
+            exit(1);
+        }
+
+        // Set scheduling policy
+        os_sched_policy policy_id;
+        if      (cstr_eq(g_opts.sched_policy, "rr"))        policy_id = OS_SCHED_RR;
+        else if (cstr_eq(g_opts.sched_policy, "fifo"))      policy_id = OS_SCHED_FIFO;
+        else                                                policy_id = OS_SCHED_OTHER; 
+
+        if (os_thread_set_priority(self, policy_id, g_opts.sched_prio) < 0) {
+            error("Failed to set thread priority\n");
+            exit(1);
+        }
+    }
+
+    int pkt_count = 0;
+    switch (g_opts.role_id) {
+        case ROLE_TX:       pkt_count = do_tx(&g_opts, sock);   break;
+        case ROLE_RX:     pkt_count = do_rx(&g_opts, sock);   break;
+        case ROLE_PING:         pkt_count = do_ping(&g_opts, sock); break;
+        case ROLE_PONG:         pkt_count = do_pong(&g_opts, sock); break;
+        default:                error("Invalid role id: %d\n", g_opts.role_id); break;
+    }
+
+#if STAT_THREAD
+    if (g_opts.role_id == ROLE_TX) {
+        while (!g_finished_to_gather_stats)     usleep(1000 * 10);
+        pthread_join(stats_thread, NULL);
+    }
+#endif
+
+    options_t *opts = &g_opts;
+
+    ////////////////////////////////////////////////////////////////////////////
+    // Write results to file
+    if (opts->role_id == ROLE_TX || opts->role_id == ROLE_RX) {
+        info("Saving results\n");
+
+        char *kernel_str = NULL;
+
+        {
+            // get the cmdline use to boot the kernel
+            char cmdline[1024] = {0};
+            FILE *file_cmdline = fopen("/proc/cmdline", "r");
+            if (file_cmdline) {
+                char *ret = fgets(cmdline, sizeof(cmdline), file_cmdline);
+                if (ret == NULL) {
+                    error("Failed to read /proc/cmdline\n");
+                    exit(1);
+                }
+                fclose(file_cmdline);   
+
+                // remove newline
+                cmdline[strcspn(cmdline, "\n")] = 0;
+            }
+
+            char *rt  = strstr(opts->os_info.release, "rt");
+            char *pro = strstr(opts->os_info.release, "realtime");
+            if (rt || pro) {
+                info("Detected Realtime OS: %s %s (%s)\n", opts->os_info.sysname, opts->os_info.release, cmdline);
+
+                // check if boot cmdline contains `rcu_nocb` or `irqaffinity`
+                if (strstr(cmdline, "rcu_nocb") || strstr(cmdline, "irqaffinity")) {
+                    kernel_str = "rt-params";
+                } else {
+                    kernel_str = rt != NULL ? "rt" : "realtime";
+                }
+
+            } else {
+                info("Detected Non-Realtime OS: %s %s (%s)\n", opts->os_info.sysname, opts->os_info.release, cmdline);
+                kernel_str = "linux";
+            }
+        }
+
+        char *output       = NULL;
+        FILE *file_results = NULL;
+        if (g_opts.save_file) {
+            char filename[128] = {0};
+            snprintf(filename, sizeof(filename), "%s_%ldus_%s.csv", opts->role_name, opts->cycle_time / 1000, kernel_str);
+            file_results = fopen(filename, "w");
+            output       = filename;
+        } else {
+            file_results = stdout;
+            output       = "STDOUT";
+        }
+
+        info("Writing results to %s\n", output);
+
+        fprintf(file_results,
+                "# cfg: P=%s, p=%d, r=%s, i=%s, d=%s, o=%d, s=%d, c=%s, n=%ld, C=%ld, v=%d\n\n",
+                opts->sched_policy, opts->sched_prio, opts->role_name, opts->interface, opts->dest_ip,
+                opts->port, opts->packet_size, opts->cpus, opts->num_packets, opts->cycle_time,
+                opts->verbose);
+
+        if (g_opts.role_id == ROLE_TX) {
+            fprintf(file_results, "id, tx_app, tx_sched, tx_sw, tx_hw\n");
+            for (int i = 0; i < pkt_count; ++i) {
+                rtn_pkt_stat *pstat = &g_pkt_stats.stats[i];
+                fprintf(file_results, 
+                        "%ld, %ld, %ld, %ld, %ld\n", 
+                        pstat->id, pstat->app_tstamps.tx_ts, pstat->tx_tstamps.sched_ts, 
+                        pstat->tx_tstamps.sw_ts, pstat->tx_tstamps.hw_ts);
+            }
+        } else {
+            fprintf(file_results, "id, rx_app, rx_sw, rx_hw\n");
+            for (int i = 0; i < pkt_count; i++) {
+                rtn_pkt_stat *stat = &g_pkt_stats.stats[i];
+                fprintf(file_results,
+                        "%ld, %ld, %ld, %ld\n", 
+                        stat->id, stat->app_tstamps.rx_ts, stat->rx_tstamps.sw_ts, stat->rx_tstamps.hw_ts);
+            }
+        }
+
+        fclose(file_results);
+    }
+    
+    rtn_socket_destroy(sock);
+
     return 0;
 }
